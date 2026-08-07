@@ -1,11 +1,7 @@
 MIT License
 
-Copyright (c) 2026 Cesar Jefferson Samillan Vasquez
-                    Mercedes Acosta Román
-                    Gladys Bernardita León Montoya
-
-Universidad Nacional Toribio Rodríguez de Mendoza
-Universidad Nacional Autónoma de Tayacaja Daniel Hernández Morillo
+Copyright (c) 2026 Cesar Jefferson Samillan Vasquez, Mercedes Acosta Román,
+Gladys Bernardita León Montoya, Rosa Ysabel Bazán Valque
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

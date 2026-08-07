@@ -1,5 +1,5 @@
 # ============================================================
-# JoinPoint-Health v2.0.0 — Dependencias requeridas
+# JoinPoint-Health v2.1.0 — Dependencias requeridas
 # ============================================================
 # Instalación: pip install -r requirements.txt
 #
@@ -7,16 +7,19 @@
 #   Cesar Jefferson Samillan Vasquez
 #   Mercedes Acosta Román
 #   Gladys Bernardita León Montoya
+#   Rosa Ysabel Bazán Valque
 #
 # Instituciones:
-#   Universidad Nacional Toribio Rodríguez de Mendoza
+#   Universidad Nacional Toribio Rodríguez de Mendoza de Amazonas
 #   Universidad Nacional Autónoma de Tayacaja Daniel Hernández Morillo
+#
+# Contacto: cesar.samillan@untrm.edu.pe
 # ============================================================
 
 # --- Dependencias principales (obligatorias) ---
 pandas>=1.3.0          # Manipulación de DataFrames y exportación a Excel
-numpy>=1.21.0          # Operaciones numéricas y ajuste de regresión
-statsmodels>=0.13.0    # Regresión OLS, parámetros, p-valores e intervalos de confianza
+numpy>=1.21.0          # Operaciones numéricas y matriz de diseño del spline
+statsmodels>=0.13.0    # Ajuste OLS/WLS, matriz de covarianzas e inferencia
 matplotlib>=3.4.0      # Gráficos de tendencia, BIC y barras comparativas
 openpyxl>=3.0.0        # Exportación de resultados a archivos .xlsx
 

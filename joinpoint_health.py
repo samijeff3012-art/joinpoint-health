@@ -1,869 +1,789 @@
 # -*- coding: utf-8 -*-
 """
-joinpoint_health.py  —  JoinPoint-Health v2.0.0
-================================================
-A generalized tool for joinpoint regression analysis of quantitative
-health indicators over time.
+joinpoint_health.py — JoinPoint-Health v2.1.0
+=============================================
+Herramienta generalizada de regresión joinpoint para indicadores
+cuantitativos de salud en series de tiempo.
 
-Automatically detects the optimal number of structural breakpoints using
-the Bayesian Information Criterion (BIC), calculates Annual Percent Change
-(APC) per segment with 95% confidence intervals and p-values, supports
-stratified and life-cycle analysis, and produces publication-ready trend
-plots, BIC model-selection charts, and geographic choropleth maps.
+Novedades de la versión 2.1.0
+-----------------------------
+La versión 2.0.0 ajustaba cada segmento mediante regresiones OLS
+independientes. Ese procedimiento produce un modelo discontinuo en los
+puntos de quiebre y, por tanto, no corresponde a la regresión joinpoint
+descrita por Kim et al. (2000), que exige continuidad en las uniones.
+La versión 2.1.0 corrige ese comportamiento:
 
-Author  : Cesar Jefferson Samillan Vasquez, Mercedes Acosta Román, Gladys Bernardita León Montoya
-Version : 2.0.0
-License : MIT
-DOI     : [To be assigned via Zenodo]
+1. Ajuste continuo mediante splines lineales. Se estima un único modelo
+   log(tasa) = b0 + b1*t + sum_k d_k * max(0, t - tau_k)
+   de modo que los segmentos se unen por construcción en cada quiebre.
+2. Cada observación se emplea una sola vez. En la versión anterior el año
+   del quiebre pertenecía a los dos segmentos adyacentes.
+3. Recuento de parámetros del BIC acorde al modelo continuo: 2 + 2k.
+4. Errores estándar e intervalos de confianza del APC derivados de la
+   matriz de covarianzas conjunta, mediante el método delta.
+5. Agregación ponderada por el tamaño poblacional cuando existen varias
+   filas por año, con `weight_col`.
+6. Prueba interna de continuidad, `check_continuity()`, que verifica que
+   los segmentos se unen en los quiebres dentro de la tolerancia numérica.
+7. Los gráficos emplean el modelo estimado y no un reajuste posterior:
+   plot_trend() dibuja la curva continua efectivamente ajustada.
 
-References
-----------
-Kim HJ, et al. (2000). Permutation tests for joinpoint regression with
-applications to cancer rates. Statistics in Medicine, 19(3), 335-351.
+Autores  : Cesar Jefferson Samillan Vasquez, Mercedes Acosta Román,
+           Gladys Bernardita León Montoya, Rosa Ysabel Bazán Valque
+Contacto : cesar.samillan@untrm.edu.pe
+Versión  : 2.1.0
+Licencia : MIT
+DOI      : 10.5281/zenodo.20151357
+Repositorio : github.com/samijeff3012-art/joinpoint-health
 
-Schwarz G. (1978). Estimating the dimension of a model. Annals of
-Statistics, 6(2), 461-464.
-
-Usage
------
->>> from joinpoint_health import JoinpointAnalyzer, LifecycleAnalyzer
->>> from joinpoint_health import analyze_health_trend
-
-# — National trend, auto-detect breakpoints
->>> az = JoinpointAnalyzer(df, year_col='Year', rate_col='Rate')
->>> az.run()
->>> az.plot_trend()
->>> print(az.summary_table())
-
-# — Life-cycle analysis
->>> lc = LifecycleAnalyzer(df, year_col='Year', rate_col='Rate',
-...                         lifecycle_col='AgeGroup')
->>> lc.run()
->>> lc.plot_trend()
->>> lc.plot_lifecycle_bars()
-
-# — Geographic map
->>> az.plot_map(region_col='Region', country_iso='PER')
+Referencias
+-----------
+Kim HJ, Fay MP, Feuer EJ, Midthune DN (2000). Permutation tests for joinpoint
+regression with applications to cancer rates. Statistics in Medicine, 19(3),
+335-351.
+Schwarz G (1978). Estimating the dimension of a model. Annals of Statistics,
+6(2), 461-464.
 """
-
 import warnings
 from itertools import combinations
 
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
+
+__version__ = "2.1.0"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 1 — CORE CLASS
-# ═══════════════════════════════════════════════════════════════════════════════
+class DataError(Exception):
+    """Error en la estructura o el contenido de los datos de entrada."""
+
 
 class JoinpointAnalyzer:
-    """
-    Joinpoint regression analyzer for quantitative health time-series.
-
-    Automatically detects the optimal number and position of structural
-    breakpoints using BIC minimisation, then calculates APC with 95 %
-    confidence intervals for each resulting segment.
+    """Analizador de regresión joinpoint con segmentos continuos.
 
     Parameters
     ----------
     data : pd.DataFrame
-        Input data with at least a year column and a rate column.
+        Datos de entrada.
     year_col : str
-        Name of the year column (integer values expected).
+        Columna del año, con valores enteros.
     rate_col : str
-        Name of the quantitative health indicator column
-        (e.g. mortality rate, incidence, prevalence).
+        Columna del indicador cuantitativo.
+    weight_col : str or None
+        Columna de tamaño poblacional o número de casos. Si se indica y hay
+        varias filas por año, las tasas se promedian ponderando por ella.
+        Si es None se emplea el promedio simple, con una advertencia.
     breakpoint_years : list[int] or None
-        Force specific breakpoints instead of searching. Example: [2014, 2019].
-        Default None (auto-detect via BIC).
+        Quiebres forzados. Si es None se detectan por BIC.
     max_breakpoints : int
-        Maximum number of breakpoints to search for (default 4).
-    group_col : str or None
-        Column for stratified analysis (e.g. 'Region', 'Sex').
-    lifecycle_col : str or None
-        Alias for group_col, used semantically for age-group analyses.
-        If both supplied, group_col takes precedence.
+        Número máximo de quiebres a evaluar.
+    group_col, lifecycle_col : str or None
+        Columna de estratificación.
     min_segment_years : int
-        Minimum observations required per segment (default 3).
+        Número mínimo de observaciones por segmento.
     log_transform : bool
-        Apply log transformation before OLS — standard for rate data
-        (default True).
+        Aplica logaritmo natural antes de la regresión.
     replace_zeros : float
-        Replacement value for zeros before log transform (default 0.01).
-
-    Attributes
-    ----------
-    results_ : dict
-        Full results after calling run().
-    breakpoints_ : list[int]
-        Optimal breakpoint years (global or per group).
-    bic_table_ : pd.DataFrame
-        BIC scores per candidate number of breakpoints.
+        Valor de reemplazo de los ceros antes del logaritmo.
     """
 
-    def __init__(
-        self,
-        data,
-        year_col,
-        rate_col,
-        breakpoint_years=None,
-        max_breakpoints=4,
-        group_col=None,
-        lifecycle_col=None,
-        min_segment_years=3,
-        log_transform=True,
-        replace_zeros=0.01,
-    ):
-        self._validate_inputs(data, year_col, rate_col, group_col, lifecycle_col)
-        self.data              = data.copy()
-        self.year_col          = year_col
-        self.rate_col          = rate_col
-        self.breakpoint_years  = breakpoint_years
-        self.max_breakpoints   = max_breakpoints
-        self.group_col         = group_col or lifecycle_col
+    def __init__(self, data, year_col, rate_col, weight_col=None,
+                 breakpoint_years=None, max_breakpoints=4, group_col=None,
+                 lifecycle_col=None, min_segment_years=3, log_transform=True,
+                 replace_zeros=0.01):
+        self._validate(data, year_col, rate_col, weight_col, group_col, lifecycle_col)
+        self.data = data.copy()
+        self.year_col = year_col
+        self.rate_col = rate_col
+        self.weight_col = weight_col
+        self.breakpoint_years = breakpoint_years
+        self.max_breakpoints = max_breakpoints
+        self.group_col = group_col or lifecycle_col
         self.min_segment_years = min_segment_years
-        self.log_transform     = log_transform
-        self.replace_zeros     = replace_zeros
-        self.results_          = {}
-        self.breakpoints_      = []
-        self.bic_table_        = pd.DataFrame()
+        self.log_transform = log_transform
+        self.replace_zeros = replace_zeros
+        self.results_ = {}
+        self.breakpoints_ = []
+        self.bic_table_ = pd.DataFrame()
 
-    # ── Validation ───────────────────────────────────────────────────────────
-
-    def _validate_inputs(self, data, year_col, rate_col, group_col, lifecycle_col):
+    # ── Validación ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _validate(data, year_col, rate_col, weight_col, group_col, lifecycle_col):
         if not isinstance(data, pd.DataFrame):
-            raise TypeError("'data' must be a pandas DataFrame.")
+            raise TypeError("'data' debe ser un DataFrame de pandas.")
         for col in [year_col, rate_col]:
             if col not in data.columns:
-                raise ValueError(f"Column '{col}' not found in DataFrame.")
-        for col in [group_col, lifecycle_col]:
+                raise ValueError(f"No se encontró la columna '{col}'.")
+        for col in [weight_col, group_col, lifecycle_col]:
             if col is not None and col not in data.columns:
-                raise ValueError(f"Column '{col}' not found in DataFrame.")
+                raise ValueError(f"No se encontró la columna '{col}'.")
         if data[rate_col].isnull().all():
-            raise ValueError(f"Column '{rate_col}' contains only null values.")
+            raise ValueError(f"La columna '{rate_col}' solo contiene valores nulos.")
+        if (pd.to_numeric(data[rate_col], errors="coerce") < 0).any():
+            raise DataError(f"La columna '{rate_col}' contiene valores negativos; "
+                            "la transformación logarítmica no está definida.")
 
-    # ── Internal helpers ─────────────────────────────────────────────────────
-
+    # ── Preparación de la serie ────────────────────────────────────────────
     def _prepare_series(self, subset):
-        agg = subset.groupby(self.year_col)[self.rate_col].mean().reset_index()
+        if self.weight_col is not None:
+            def _pond(g):
+                w = g[self.weight_col].astype(float)
+                if w.sum() <= 0:
+                    return g[self.rate_col].mean()
+                return np.average(g[self.rate_col].astype(float), weights=w)
+            agg = (subset.groupby(self.year_col).apply(_pond)
+                   .reset_index(name=self.rate_col))
+        else:
+            porano = subset.groupby(self.year_col).size()
+            if (porano > 1).any():
+                warnings.warn(
+                    "Hay varias filas por año y no se indicó weight_col: las tasas se "
+                    "promedian sin ponderar, lo que sesga el resultado cuando los "
+                    "subgrupos tienen tamaños distintos.", UserWarning)
+            agg = subset.groupby(self.year_col)[self.rate_col].mean().reset_index()
         agg = agg.sort_values(self.year_col).reset_index(drop=True)
-        agg['_y'] = (
-            np.log(agg[self.rate_col].replace(0, self.replace_zeros))
-            if self.log_transform else agg[self.rate_col]
-        )
+        agg["_y"] = (np.log(agg[self.rate_col].replace(0, self.replace_zeros))
+                     if self.log_transform else agg[self.rate_col])
         return agg
 
-    def _fit_segment(self, series, start, end):
-        seg = series[
-            (series[self.year_col] >= start) &
-            (series[self.year_col] <= end)
-        ].copy()
-        if len(seg) < 2:
+    # ── Núcleo: modelo continuo por splines lineales ───────────────────────
+    def _design(self, years, taus):
+        """Matriz de diseño del spline lineal continuo."""
+        cols = [np.ones_like(years, dtype=float), years.astype(float)]
+        for t in taus:
+            cols.append(np.maximum(0.0, years.astype(float) - float(t)))
+        return np.column_stack(cols)
+
+    def _fit_model(self, series, taus):
+        """Ajusta un único modelo continuo para todos los segmentos."""
+        years = series[self.year_col].values.astype(float)
+        y = series["_y"].values.astype(float)
+        X = self._design(years, taus)
+        if np.linalg.matrix_rank(X) < X.shape[1] or len(y) <= X.shape[1]:
             return None
+        return sm.OLS(y, X).fit()
 
-        X     = sm.add_constant(seg[self.year_col].astype(float))
-        model = sm.OLS(seg['_y'], X).fit()
-        slope = model.params[self.year_col]
-        p_val = model.pvalues[self.year_col]
-        ci    = model.conf_int().loc[self.year_col]
+    def _segments_from_model(self, model, series, taus, alpha=0.05):
+        """Deriva APC, error estándar e IC por segmento desde el modelo conjunto."""
+        from scipy import stats
+        years = series[self.year_col].values.astype(float)
+        beta = model.params
+        V = model.cov_params()
+        gl = int(model.df_resid)
+        tcrit = stats.t.ppf(1 - alpha / 2, gl)
+        limites = [years[0]] + [float(t) for t in taus] + [years[-1]]
+        segs = []
+        for i in range(len(limites) - 1):
+            # la pendiente del segmento i acumula beta1 y los deltas anteriores
+            c = np.zeros(len(beta)); c[1] = 1.0
+            for j in range(i):
+                c[2 + j] = 1.0
+            pend = float(c @ beta)
+            var = float(c @ V @ c)
+            ee = float(np.sqrt(max(var, 0.0)))
+            lo_b, hi_b = pend - tcrit * ee, pend + tcrit * ee
+            tval = pend / ee if ee > 0 else np.nan
+            pval = float(2 * stats.t.sf(abs(tval), gl)) if ee > 0 else np.nan
+            if self.log_transform:
+                apc = (np.exp(pend) - 1) * 100
+                lo = (np.exp(lo_b) - 1) * 100
+                hi = (np.exp(hi_b) - 1) * 100
+                ee_apc = float(abs(np.exp(pend)) * ee * 100)   # método delta
+            else:
+                apc, lo, hi, ee_apc = pend, lo_b, hi_b, ee
+            # recta del segmento en la escala transformada: y = a_i + s_i * t
+            a_i = float(beta[0] - sum(beta[2 + j] * limites[1 + j] for j in range(i)))
+            n_obs = int(((years >= limites[i]) & (years <= limites[i + 1])).sum())
+            segs.append(dict(
+                intercept=a_i,
+                phase=f"Segment {i + 1}",
+                period=f"{int(limites[i])}-{int(limites[i + 1])}",
+                apc=round(float(apc), 4),
+                se_apc=round(ee_apc, 4),
+                ic_95_lower=round(float(lo), 4),
+                ic_95_upper=round(float(hi), 4),
+                p_value=round(float(pval), 6) if np.isfinite(pval) else np.nan,
+                n_years=n_obs,
+                slope=pend,
+            ))
+        return segs
 
-        if self.log_transform:
-            apc      = (np.exp(slope) - 1) * 100
-            ic_lower = (np.exp(ci[0]) - 1) * 100
-            ic_upper = (np.exp(ci[1]) - 1) * 100
-        else:
-            apc, ic_lower, ic_upper = slope, ci[0], ci[1]
-
-        return {
-            'apc'        : round(float(apc), 4),
-            'ic_95_lower': round(float(ic_lower), 4),
-            'ic_95_upper': round(float(ic_upper), 4),
-            'p_value'    : round(float(p_val), 4),
-            'n_years'    : int(len(seg)),
-            'rss'        : float(model.ssr),
-            'n_params'   : int(model.df_model + 1),
-        }
-
-    def _bic(self, total_rss, n_obs, n_params):
-        if total_rss <= 0 or n_obs <= 0:
+    def _bic(self, model, n_obs, n_bp):
+        """BIC del modelo continuo: 2 parámetros de regresión + k pendientes + k quiebres."""
+        rss = float(model.ssr)
+        if rss <= 0 or n_obs <= 0:
             return np.inf
-        return n_obs * np.log(total_rss / n_obs) + n_params * np.log(n_obs)
+        n_par = 2 + 2 * n_bp
+        return n_obs * np.log(rss / n_obs) + n_par * np.log(n_obs)
 
-    def _candidate_breakpoints(self, years):
-        min_y = years[self.min_segment_years - 1]
-        max_y = years[-self.min_segment_years]
-        return [int(y) for y in years if min_y <= y <= max_y]
+    # ── Búsqueda de quiebres ───────────────────────────────────────────────
+    def _candidates(self, years):
+        return [int(y) for y in years[self.min_segment_years - 1:
+                                      len(years) - self.min_segment_years + 1]]
 
-    def _search_breakpoints(self, series):
-        """Search 0..max_breakpoints using BIC; return best list and BIC table."""
+    def _valid(self, years, taus):
+        limites = [years[0]] + sorted(taus) + [years[-1]]
+        for i in range(len(limites) - 1):
+            n = ((years >= limites[i]) & (years <= limites[i + 1])).sum()
+            if n < self.min_segment_years:
+                return False
+        return True
+
+    def _search(self, series):
         years = series[self.year_col].values
-        n_obs = len(years)
-        records = []
-
-        seg0 = self._fit_segment(series, years[0], years[-1])
-        bic0 = self._bic(seg0['rss'], n_obs, seg0['n_params']) if seg0 else np.inf
-        records.append({'n_breakpoints': 0, 'breakpoints': [], 'BIC': round(bic0, 4)})
-
-        best_bic = bic0
-        best_bps = []
-        candidates = self._candidate_breakpoints(years)
-
-        for n_bp in range(1, self.max_breakpoints + 1):
-            if len(candidates) < n_bp:
+        n = len(years)
+        registros = []
+        m0 = self._fit_model(series, [])
+        b0 = self._bic(m0, n, 0) if m0 is not None else np.inf
+        registros.append(dict(n_breakpoints=0, breakpoints=[], BIC=round(b0, 4)))
+        mejor_bic, mejor = b0, []
+        cand = self._candidates(years)
+        for k in range(1, self.max_breakpoints + 1):
+            if len(cand) < k:
                 break
-            local_best_bic   = np.inf
-            local_best_combo = None
-
-            for combo in combinations(candidates, n_bp):
-                combo      = sorted(combo)
-                boundaries = [years[0]] + combo + [years[-1]]
-                valid = all(
-                    boundaries[i + 1] - boundaries[i] >= self.min_segment_years - 1
-                    for i in range(len(boundaries) - 1)
-                )
-                if not valid:
+            lb, lc = np.inf, None
+            for combo in combinations(cand, k):
+                combo = sorted(combo)
+                if not self._valid(years, combo):
                     continue
-
-                total_rss  = 0.0
-                total_pars = 0
-                ok = True
-                for i in range(len(boundaries) - 1):
-                    seg = self._fit_segment(series, boundaries[i], boundaries[i + 1])
-                    if seg is None:
-                        ok = False
-                        break
-                    total_rss  += seg['rss']
-                    total_pars += seg['n_params']
-
-                if not ok:
+                m = self._fit_model(series, combo)
+                if m is None:
                     continue
+                v = self._bic(m, n, k)
+                if v < lb:
+                    lb, lc = v, list(combo)
+            if lc is not None:
+                registros.append(dict(n_breakpoints=k, breakpoints=lc, BIC=round(lb, 4)))
+                if lb < mejor_bic:
+                    mejor_bic, mejor = lb, lc
+        return mejor, registros
 
-                bic_val = self._bic(total_rss, n_obs, total_pars + n_bp)
-                if bic_val < local_best_bic:
-                    local_best_bic   = bic_val
-                    local_best_combo = list(combo)
-
-            if local_best_combo is not None:
-                records.append({
-                    'n_breakpoints': n_bp,
-                    'breakpoints'  : local_best_combo,
-                    'BIC'          : round(local_best_bic, 4),
-                })
-                if local_best_bic < best_bic:
-                    best_bic = local_best_bic
-                    best_bps = local_best_combo
-
-        return best_bps, records
-
-    def _build_segments(self, series, bps):
-        years      = series[self.year_col].values
-        boundaries = [years[0]] + sorted(bps) + [years[-1]]
-        segments   = []
-        for i in range(len(boundaries) - 1):
-            start = int(boundaries[i])
-            end   = int(boundaries[i + 1])
-            seg   = self._fit_segment(series, start, end)
-            if seg:
-                seg['period'] = f"{start}-{end}"
-                seg['phase']  = f"Segment {i + 1}"
-                segments.append(seg)
-        return segments
-
-    def _analyze_single(self, subset, label='Overall'):
+    # ── Análisis ───────────────────────────────────────────────────────────
+    def _analyze_single(self, subset, label="Overall"):
         series = self._prepare_series(subset)
-
+        years = series[self.year_col].values
         if self.breakpoint_years is not None:
-            bps     = sorted(self.breakpoint_years)
-            bic_rec = [{'n_breakpoints': len(bps), 'breakpoints': bps, 'BIC': None}]
+            bps = sorted(int(b) for b in self.breakpoint_years)
+            fuera = [b for b in bps if not (years[0] < b < years[-1])]
+            if fuera:
+                raise DataError(f"Quiebres fuera del rango de la serie: {fuera}")
+            if not self._valid(years, bps):
+                raise DataError(
+                    f"Los quiebres {bps} generan segmentos con menos de "
+                    f"{self.min_segment_years} observaciones.")
+            registros = [dict(n_breakpoints=len(bps), breakpoints=bps, BIC=None)]
         else:
-            bps, bic_rec = self._search_breakpoints(series)
-
-        segments = self._build_segments(series, bps)
-        return {
-            'label'      : label,
-            'breakpoints': bps,
-            'segments'   : segments,
-            'bic_table'  : pd.DataFrame(bic_rec),
-            '_series'    : series,
-        }
-
-    # ── Public API ───────────────────────────────────────────────────────────
+            bps, registros = self._search(series)
+        modelo = self._fit_model(series, bps)
+        if modelo is None:
+            raise DataError(f"No fue posible ajustar el modelo para '{label}'.")
+        segs = self._segments_from_model(modelo, series, bps)
+        return dict(label=label, breakpoints=bps, segments=segs,
+                    bic_table=pd.DataFrame(registros), model=modelo,
+                    _series=series, _taus=bps)
 
     def run(self):
-        """
-        Execute the joinpoint analysis.
-
-        Returns self for chaining. Results stored in self.results_.
-        """
         if self.group_col is None:
-            self.results_     = self._analyze_single(self.data, label='Overall')
-            self.breakpoints_ = self.results_['breakpoints']
-            self.bic_table_   = self.results_['bic_table']
+            self.results_ = self._analyze_single(self.data)
+            self.breakpoints_ = self.results_["breakpoints"]
+            self.bic_table_ = self.results_["bic_table"]
         else:
-            groups = self.data[self.group_col].dropna().unique()
             self.results_ = {}
-            bic_all = []
-            for grp in sorted(groups):
-                subset = self.data[self.data[self.group_col] == grp]
-                res    = self._analyze_single(subset, label=str(grp))
-                self.results_[grp] = res
-                bic_all.append(res['bic_table'].assign(group=grp))
-            if bic_all:
-                self.bic_table_ = pd.concat(bic_all, ignore_index=True)
+            bics = []
+            for g in sorted(self.data[self.group_col].dropna().unique()):
+                res = self._analyze_single(self.data[self.data[self.group_col] == g], str(g))
+                self.results_[g] = res
+                bics.append(res["bic_table"].assign(group=g))
+            if bics:
+                self.bic_table_ = pd.concat(bics, ignore_index=True)
         return self
 
-    def summary_table(self):
-        """
-        Return a publication-ready summary DataFrame.
+    # ── Verificación de continuidad ────────────────────────────────────────
+    def check_continuity(self, tol=1e-8, verbose=True):
+        """Verifica que los segmentos se unen en cada quiebre.
 
-        Columns: Group, Breakpoints, Segment, Period, APC (%), IC 95%,
-                 p-value, n years.
+        Devuelve un DataFrame con el salto observado en cada punto de unión.
+        En un modelo joinpoint correcto todos los saltos deben ser nulos
+        dentro de la tolerancia numérica.
         """
-        rows    = []
-        results = self.results_
+        resultados = (self.results_ if isinstance(self.results_, dict)
+                      and "label" in self.results_ else None)
+        conjuntos = [resultados] if resultados else list(self.results_.values())
+        filas = []
+        for res in conjuntos:
+            if not res:
+                continue
+            segs, taus = res["segments"], res["_taus"]
+            for i, t in enumerate(taus):
+                s_izq, s_der = segs[i], segs[i + 1]
+                izq = s_izq["intercept"] + s_izq["slope"] * float(t)
+                der = s_der["intercept"] + s_der["slope"] * float(t)
+                salto = abs(der - izq)
+                filas.append(dict(group=res["label"], breakpoint=int(t),
+                                  jump=salto, continuous=salto < tol))
+        out = pd.DataFrame(filas)
+        if verbose:
+            if out.empty:
+                print("Sin quiebres que verificar: el modelo tiene un solo segmento.")
+            elif out["continuous"].all():
+                print(f"Continuidad verificada en {len(out)} punto(s) de unión "
+                      f"(salto máximo {out['jump'].max():.2e}).")
+            else:
+                print("ATENCIÓN: se detectaron discontinuidades.")
+                print(out.to_string(index=False))
+        return out
+
+    # ── Salidas ────────────────────────────────────────────────────────────
+    def summary_table(self):
+        filas = []
 
         def _add(res):
-            bps_str = ', '.join(str(b) for b in res['breakpoints']) or 'None'
-            for seg in res['segments']:
-                rows.append({
-                    'Group'      : res['label'],
-                    'Breakpoints': bps_str,
-                    'Segment'    : seg['phase'],
-                    'Period'     : seg['period'],
-                    'APC (%)'    : seg['apc'],
-                    'IC 95%'     : f"[{seg['ic_95_lower']}, {seg['ic_95_upper']}]",
-                    'p-value'    : seg['p_value'],
-                    'n years'    : seg['n_years'],
+            bps = ", ".join(str(b) for b in res["breakpoints"]) or "None"
+            for s in res["segments"]:
+                filas.append({
+                    "Group": res["label"], "Breakpoints": bps,
+                    "Segment": s["phase"], "Period": s["period"],
+                    "APC (%)": s["apc"], "SE": s["se_apc"],
+                    "IC 95%": f"[{s['ic_95_lower']}, {s['ic_95_upper']}]",
+                    "p-value": s["p_value"], "n years": s["n_years"],
                 })
 
-        if isinstance(results, dict) and 'label' in results:
-            _add(results)
+        if isinstance(self.results_, dict) and "label" in self.results_:
+            _add(self.results_)
         else:
-            for res in results.values():
+            for res in self.results_.values():
                 if res:
                     _add(res)
+        return pd.DataFrame(filas)
 
-        return pd.DataFrame(rows)
+    def fitted_values(self, group=None):
+        """Valores ajustados por el modelo continuo, en la escala original."""
+        res = (self.results_ if isinstance(self.results_, dict) and "label" in self.results_
+               else self.results_[group])
+        series, m, taus = res["_series"], res["model"], res["_taus"]
+        years = series[self.year_col].values.astype(float)
+        pred = self._design(years, taus) @ m.params
+        return pd.DataFrame({
+            self.year_col: years.astype(int),
+            "observed": series[self.rate_col].values,
+            "fitted": np.exp(pred) if self.log_transform else pred,
+        })
 
-    def export_results(self, path='joinpoint_results.xlsx'):
-        """Export summary table to Excel."""
-        self.summary_table().to_excel(path, index=False)
-        print(f"Results exported to: {path}")
 
-    # ── Plotting: trend ──────────────────────────────────────────────────────
-
+    # ── Visualización ──────────────────────────────────────────────────────
     def plot_trend(
         self,
-        title='JoinPoint-Health: Trend Analysis',
-        ylabel='Rate per 100,000 inhabitants',
-        xlabel='Year',
-        style='grayscale',
+        title="JoinPoint-Health: análisis de tendencia",
+        ylabel="Tasa por 100 000 habitantes",
+        xlabel="Año",
+        style="grayscale",
         figsize=(10, 6),
         save_path=None,
     ):
         """
-        Plot observed rates, fitted segment lines and breakpoint markers.
+        Grafica las tasas observadas, la curva ajustada y los quiebres.
 
-        One panel per group when group_col / lifecycle_col is provided.
+        A diferencia de la versión 2.0.0, la curva proviene del modelo
+        continuo efectivamente estimado y no de un reajuste posterior por
+        segmentos: por construcción no presenta saltos en los quiebres.
+
+        Un panel por grupo cuando se ha indicado group_col o lifecycle_col.
 
         Parameters
         ----------
-        title : str
-            Figure title.
-        ylabel : str
-            Y-axis label.
-        xlabel : str
-            X-axis label.
+        title, ylabel, xlabel : str
+            Título y etiquetas de los ejes.
         style : str
-            Matplotlib style (default 'grayscale' for publications).
+            Estilo de matplotlib (por defecto 'grayscale', apto para
+            publicaciones impresas).
         figsize : tuple
-            Base panel size in inches.
+            Tamaño base de cada panel, en pulgadas.
         save_path : str or None
-            Save figure at 300 dpi if provided.
+            Ruta donde guardar la figura a 300 ppp.
         """
+        import matplotlib.pyplot as plt
+
+        if not self.results_:
+            print("Ejecute .run() primero.")
+            return
+
         plt.style.use(style)
-        linestyles = ['-', '--', ':', '-.', (0, (3, 1, 1, 1))]
-        shades     = ['black', 'dimgray', 'gray', 'darkgray', 'silver']
+        linestyles = ["-", "--", ":", "-.", (0, (3, 1, 1, 1))]
 
         def _plot_one(ax, res):
-            series = res['_series']
-            years  = series[self.year_col].values
-            rates  = series[self.rate_col].values
+            series = res["_series"]
+            years = series[self.year_col].values.astype(float)
+            rates = series[self.rate_col].values
+            taus = res["_taus"]
 
-            ax.scatter(years, rates, color='black', zorder=5,
-                       label='Observed rates', s=40)
+            ax.scatter(years, rates, color="black", zorder=5,
+                       label="Tasa observada", s=38)
 
-            for i, seg in enumerate(res['segments']):
-                y0, y1 = map(int, seg['period'].split('-'))
-                mask   = (years >= y0) & (years <= y1)
-                sx, sy = years[mask].astype(float), rates[mask]
-                if len(sx) < 2:
-                    continue
-                z      = np.polyfit(sx,
-                                    np.log(sy + 1e-9) if self.log_transform else sy, 1)
-                fitted = (np.exp(np.poly1d(z)(sx))
-                          if self.log_transform else np.poly1d(z)(sx))
-                lbl = (f"{seg['phase']} ({seg['period']}): "
-                       f"APC={seg['apc']:+.2f}%  p={seg['p_value']:.3f}")
-                ax.plot(sx, fitted,
-                        linestyle=linestyles[i % len(linestyles)],
-                        color=shades[i % len(shades)],
-                        linewidth=1.8, label=lbl)
+            # Curva del modelo continuo, evaluada en una malla fina
+            malla = np.linspace(years.min(), years.max(), 400)
+            pred = self._design(malla, taus) @ res["model"].params
+            ajust = np.exp(pred) if self.log_transform else pred
+            ax.plot(malla, ajust, color="black", linewidth=1.9, zorder=4,
+                    label="Modelo continuo ajustado")
 
-            for bp in res['breakpoints']:
-                ax.axvline(x=bp, color='gray', linestyle=':', alpha=0.5,
-                           label=f'Breakpoint ({bp})')
+            # Sombreado y etiqueta por segmento
+            for i, seg in enumerate(res["segments"]):
+                y0, y1 = (int(v) for v in seg["period"].split("-"))
+                if i % 2 == 1:
+                    ax.axvspan(y0, y1, color="black", alpha=0.04, zorder=0)
+                xm = (y0 + y1) / 2
+                ym = np.exp(self._design(np.array([xm]), taus) @ res["model"].params)[0] \
+                    if self.log_transform else \
+                    (self._design(np.array([xm]), taus) @ res["model"].params)[0]
+                signo = "*" if seg["p_value"] < 0.05 else ""
+                ax.annotate(f"APC {seg['apc']:+.2f}%{signo}",
+                            xy=(xm, ym), xytext=(0, 12),
+                            textcoords="offset points", ha="center",
+                            fontsize=7.5, color="#303030")
 
-            ax.set_title(res['label'], fontsize=11, fontweight='bold')
+            for bp in res["breakpoints"]:
+                ax.axvline(x=bp, color="gray", linestyle=":", alpha=0.7,
+                           linewidth=1.2)
+                ax.annotate(f"quiebre {bp}", xy=(bp, ax.get_ylim()[1]),
+                            xytext=(3, -12), textcoords="offset points",
+                            fontsize=7, color="gray", rotation=90, va="top")
+
+            ax.set_title(res["label"], fontsize=11, fontweight="bold")
             ax.set_xlabel(xlabel, fontsize=9)
             ax.set_ylabel(ylabel, fontsize=9)
-            ax.legend(fontsize=7, loc='best')
+            ax.legend(fontsize=7.5, loc="best")
             ax.grid(True, alpha=0.2)
 
-        results  = self.results_
-        singular = isinstance(results, dict) and 'label' in results
-
+        singular = isinstance(self.results_, dict) and "label" in self.results_
         if singular:
             fig, ax = plt.subplots(figsize=figsize)
-            fig.suptitle(title, fontsize=13, fontweight='bold')
-            _plot_one(ax, results)
+            fig.suptitle(title, fontsize=13, fontweight="bold")
+            _plot_one(ax, self.results_)
         else:
-            valid = {k: v for k, v in results.items() if v and '_series' in v}
-            n     = len(valid)
-            cols  = min(3, n)
-            rows  = (n + cols - 1) // cols
-            fig, axes = plt.subplots(rows, cols,
-                                     figsize=(figsize[0] * cols, figsize[1] * rows))
-            fig.suptitle(title, fontsize=13, fontweight='bold')
-            flat = np.array(axes).flatten() if n > 1 else [axes]
-            for ax, (_, res) in zip(flat, valid.items()):
+            validos = {k: v for k, v in self.results_.items() if v and "_series" in v}
+            n = len(validos)
+            if n == 0:
+                print("No hay resultados que graficar.")
+                return
+            cols = min(3, n)
+            filas = (n + cols - 1) // cols
+            fig, axes = plt.subplots(filas, cols,
+                                     figsize=(figsize[0] * cols, figsize[1] * filas))
+            fig.suptitle(title, fontsize=13, fontweight="bold")
+            planos = np.array(axes).flatten() if n > 1 else [axes]
+            for ax, (_, res) in zip(planos, validos.items()):
                 _plot_one(ax, res)
-            for ax in flat[n:]:
+            for ax in planos[n:]:
                 ax.set_visible(False)
 
         plt.tight_layout()
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Trend figure saved: {save_path}")
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            print(f"Figura de tendencia guardada: {save_path}")
         plt.show()
 
-    # ── Plotting: BIC selection ───────────────────────────────────────────────
-
-    def plot_bic(self, save_path=None):
+    def plot_bic(self, save_path=None, figsize=(6, 4)):
         """
-        Plot BIC score vs. number of breakpoints (model selection chart).
+        Grafica el BIC frente al número de quiebres evaluados.
 
-        Shows why the algorithm chose a specific number of breakpoints.
-        The minimum BIC point is marked with a dashed vertical line.
+        Muestra por qué el algoritmo eligió determinada configuración. El
+        mínimo se marca con una línea vertical discontinua. Incluir esta
+        curva en una publicación aporta transparencia sobre la decisión del
+        modelo.
 
         Parameters
         ----------
         save_path : str or None
-            Save figure at 300 dpi if provided.
+            Ruta donde guardar la figura a 300 ppp.
+        figsize : tuple
+            Tamaño del panel, en pulgadas.
         """
-        if self.bic_table_.empty:
-            print("Run .run() first.")
+        import matplotlib.pyplot as plt
+
+        if self.bic_table_ is None or self.bic_table_.empty:
+            print("Ejecute .run() primero.")
+            return
+        tabla = self.bic_table_.dropna(subset=["BIC"]).copy()
+        if tabla.empty:
+            print("No hay curva BIC: los quiebres se fijaron manualmente.")
             return
 
-        plt.style.use('grayscale')
-        bic_df = self.bic_table_.copy()
+        plt.style.use("grayscale")
 
-        if 'group' in bic_df.columns:
-            groups = bic_df['group'].unique()
-            fig, axes = plt.subplots(1, len(groups),
-                                     figsize=(5 * len(groups), 4))
-            axes = [axes] if len(groups) == 1 else list(np.array(axes).flatten())
-            for ax, grp in zip(axes, groups):
-                sub  = bic_df[bic_df['group'] == grp].dropna(subset=['BIC'])
-                best = sub.loc[sub['BIC'].idxmin()]
-                ax.plot(sub['n_breakpoints'], sub['BIC'], marker='o', color='black')
-                ax.axvline(x=best['n_breakpoints'], color='gray', linestyle='--',
-                           label=f"Best: {int(best['n_breakpoints'])} bp")
-                ax.set_title(str(grp), fontsize=10)
-                ax.set_xlabel('Number of breakpoints')
-                ax.set_ylabel('BIC')
-                ax.legend(fontsize=8)
-                ax.grid(True, alpha=0.2)
-        else:
-            fig, ax = plt.subplots(figsize=(6, 4))
-            sub  = bic_df.dropna(subset=['BIC'])
-            best = sub.loc[sub['BIC'].idxmin()]
-            ax.plot(sub['n_breakpoints'], sub['BIC'], marker='o', color='black')
-            ax.axvline(x=best['n_breakpoints'], color='gray', linestyle='--',
-                       label=f"Best: {int(best['n_breakpoints'])} bp")
-            ax.set_xlabel('Number of breakpoints')
-            ax.set_ylabel('BIC')
-            ax.set_title('BIC Model Selection', fontweight='bold')
-            ax.legend()
+        def _uno(ax, sub, titulo):
+            mejor = sub.loc[sub["BIC"].idxmin()]
+            ax.plot(sub["n_breakpoints"], sub["BIC"], marker="o", color="black")
+            ax.axvline(x=mejor["n_breakpoints"], color="gray", linestyle="--",
+                       label=f"Elegido: {int(mejor['n_breakpoints'])} quiebre(s)")
+            ax.set_xlabel("Número de quiebres", fontsize=9)
+            ax.set_ylabel("BIC", fontsize=9)
+            ax.set_title(titulo, fontsize=10, fontweight="bold")
+            ax.legend(fontsize=8)
             ax.grid(True, alpha=0.2)
+            ax.set_xticks(sorted(sub["n_breakpoints"].unique()))
 
-        plt.suptitle('JoinPoint-Health — BIC Model Selection', fontsize=11)
+        if "group" in tabla.columns:
+            grupos = list(tabla["group"].unique())
+            fig, axes = plt.subplots(1, len(grupos),
+                                     figsize=(figsize[0] * len(grupos), figsize[1]))
+            axes = [axes] if len(grupos) == 1 else list(np.array(axes).flatten())
+            for ax, g in zip(axes, grupos):
+                _uno(ax, tabla[tabla["group"] == g], str(g))
+        else:
+            fig, ax = plt.subplots(figsize=figsize)
+            _uno(ax, tabla, "Selección del modelo por BIC")
+
         plt.tight_layout()
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"BIC figure saved: {save_path}")
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            print(f"Figura BIC guardada: {save_path}")
         plt.show()
-
-    # ── Plotting: geographic map ──────────────────────────────────────────────
 
     def plot_map(
         self,
-        region_col,
+        region_col=None,
         geojson_url=None,
         region_name_field=None,
-        country_iso='PER',
-        metric='apc',
+        country_iso="PER",
+        metric="apc",
         segment=-1,
-        title='JoinPoint-Health: Geographic Distribution',
-        cmap='RdYlGn_r',
+        title="JoinPoint-Health: distribución geográfica",
+        cmap="RdYlGn_r",
         figsize=(12, 14),
         save_path=None,
     ):
         """
-        Choropleth map of APC (or p-value) by region.
+        Mapa coroplético del APC (o del valor p) por región.
 
-        Requires geopandas. Any GeoJSON boundary file can be supplied;
-        the default covers Peru at the departmental level.
+        Requiere geopandas y un archivo GeoJSON de límites. El predeterminado
+        cubre el Perú a nivel departamental. El análisis debe haberse
+        ejecutado con group_col igual a la columna de región.
 
         Parameters
         ----------
-        region_col : str
-            Column in data whose values match region names in the GeoJSON.
+        region_col : str or None
+            Se conserva por compatibilidad; las regiones se toman de las
+            etiquetas de los resultados, es decir, de group_col.
         geojson_url : str or None
-            URL to a GeoJSON boundary file. Defaults to Peru if None.
+            URL de un GeoJSON de límites. Si es None se usa el del Perú.
         region_name_field : str or None
-            Property in the GeoJSON containing region names.
-            Auto-detected from common field names if None.
+            Propiedad del GeoJSON que contiene el nombre de la región. Se
+            detecta automáticamente si es None.
         country_iso : str
-            ISO 3166-1 alpha-3 code for default GeoJSON selection
-            (default 'PER').
+            Código ISO 3166-1 alfa-3 para elegir el GeoJSON por defecto.
         metric : str
-            'apc' or 'p_value' (default 'apc').
+            'apc' o 'p_value'.
         segment : int
-            Which segment index to map. -1 = last (post-breakpoint),
-            0 = first (pre-breakpoint).
+            Índice del segmento a mapear. -1 es el último (posterior al
+            quiebre); 0 es el primero.
         title : str
-            Map title.
+            Título del mapa.
         cmap : str
-            Matplotlib colormap (default 'RdYlGn_r').
+            Mapa de color de matplotlib.
         figsize : tuple
-            Figure size in inches.
+            Tamaño de la figura, en pulgadas.
         save_path : str or None
-            Save map at 300 dpi if provided.
+            Ruta donde guardar el mapa a 300 ppp.
         """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+
         try:
             import geopandas as gpd
         except ImportError:
             raise ImportError(
-                "geopandas required. Install with: pip install geopandas"
-            )
+                "plot_map() requiere geopandas. Instálelo con: pip install geopandas")
 
-        # Build per-region metric table
-        results = self.results_
-        rows    = []
+        filas = []
 
-        def _extract(res):
-            segs = res.get('segments', [])
+        def _extraer(res):
+            segs = res.get("segments", [])
             if not segs:
                 return
             idx = segment if segment >= 0 else len(segs) + segment
             idx = max(0, min(idx, len(segs) - 1))
-            seg = segs[idx]
-            rows.append({
-                'region' : res['label'],
-                'apc'    : seg['apc'],
-                'p_value': seg['p_value'],
-            })
+            s = segs[idx]
+            filas.append({"region": res["label"], "apc": s["apc"],
+                          "p_value": s["p_value"]})
 
-        if isinstance(results, dict) and 'label' in results:
-            _extract(results)
+        if isinstance(self.results_, dict) and "label" in self.results_:
+            _extraer(self.results_)
         else:
-            for res in results.values():
+            for res in self.results_.values():
                 if res:
-                    _extract(res)
+                    _extraer(res)
 
-        if not rows:
-            print("No results. Run .run() before .plot_map().")
+        if not filas:
+            print("No hay resultados. Ejecute .run() antes de .plot_map().")
             return
+        if len(filas) == 1:
+            warnings.warn(
+                "Solo hay una región en los resultados. Ejecute el análisis con "
+                "group_col igual a la columna de región para obtener un mapa.")
 
-        df_metric = pd.DataFrame(rows)
+        df_metric = pd.DataFrame(filas)
 
-        # Load GeoJSON
-        DEFAULT_URLS = {
-            'PER': ('https://raw.githubusercontent.com/juaneladio/'
-                    'peru-geojson/master/peru_departamental_simple.geojson'),
-        }
-        url = geojson_url or DEFAULT_URLS.get(country_iso.upper(),
-                                               DEFAULT_URLS['PER'])
+        URLS = {"PER": ("https://raw.githubusercontent.com/juaneladio/"
+                        "peru-geojson/master/peru_departamental_simple.geojson")}
+        url = geojson_url or URLS.get(country_iso.upper(), URLS["PER"])
         try:
             gdf = gpd.read_file(url)
         except Exception as e:
-            print(f"Could not load GeoJSON from {url}.\nError: {e}")
+            print(f"No se pudo cargar el GeoJSON desde {url}.\nError: {e}")
             return
 
-        # Auto-detect name field
         if region_name_field is None:
-            candidates = [c for c in gdf.columns
-                          if any(k in c.upper()
-                                 for k in ['NAME', 'NOMBRE', 'NOMB', 'REGION', 'DEP'])]
-            region_name_field = candidates[0] if candidates else gdf.columns[0]
+            cand = [c for c in gdf.columns
+                    if any(k in c.upper()
+                           for k in ["NAME", "NOMBRE", "NOMB", "REGION", "DEP"])]
+            region_name_field = cand[0] if cand else gdf.columns[0]
 
-        # Merge
-        gdf['_key']        = gdf[region_name_field].str.upper().str.strip()
-        df_metric['_key']  = df_metric['region'].str.upper().str.strip()
-        gdf = gdf.merge(df_metric[['_key', metric]], on='_key', how='left')
+        gdf["_key"] = gdf[region_name_field].astype(str).str.upper().str.strip()
+        df_metric["_key"] = df_metric["region"].astype(str).str.upper().str.strip()
+        gdf = gdf.merge(df_metric[["_key", metric]], on="_key", how="left")
 
-        # Plot
+        sin_datos = int(gdf[metric].isna().sum())
+        if sin_datos == len(gdf):
+            print("Ninguna región del GeoJSON coincidió con las etiquetas de los "
+                  "resultados. Revise la ortografía de la columna de región.")
+            return
+
         fig, ax = plt.subplots(1, 1, figsize=figsize)
-        gdf[gdf[metric].isna()].plot(ax=ax, color='#e0e0e0',
-                                     edgecolor='white', linewidth=0.5)
-        if gdf[metric].notna().any():
-            gdf[gdf[metric].notna()].plot(
-                ax=ax, column=metric, cmap=cmap,
-                edgecolor='white', linewidth=0.5, legend=True,
-                legend_kwds={
-                    'label'      : 'APC (%)' if metric == 'apc' else 'p-value',
-                    'orientation': 'horizontal',
-                    'shrink'     : 0.5,
-                },
-            )
+        gdf[gdf[metric].isna()].plot(ax=ax, color="#e0e0e0",
+                                     edgecolor="white", linewidth=0.5)
+        gdf[gdf[metric].notna()].plot(
+            ax=ax, column=metric, cmap=cmap, edgecolor="white", linewidth=0.5,
+            legend=True,
+            legend_kwds={"label": "APC (%)" if metric == "apc" else "valor p",
+                         "orientation": "horizontal", "shrink": 0.5})
 
-        ax.set_title(title, fontsize=13, fontweight='bold', pad=15)
+        ax.set_title(title, fontsize=13, fontweight="bold", pad=15)
         ax.set_axis_off()
-        no_data = mpatches.Patch(color='#e0e0e0', label='No data')
-        ax.legend(handles=[no_data], loc='lower left', frameon=False)
+        ax.legend(handles=[mpatches.Patch(color="#e0e0e0", label="Sin datos")],
+                  loc="lower left", frameon=False)
 
         plt.tight_layout()
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Map saved: {save_path}")
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            print(f"Mapa guardado: {save_path}")
         plt.show()
 
+    def export_results(self, path="joinpoint_results.xlsx"):
+        with pd.ExcelWriter(path, engine="openpyxl") as w:
+            self.summary_table().to_excel(w, sheet_name="Resumen", index=False)
+            self.bic_table_.to_excel(w, sheet_name="BIC", index=False)
+            self.check_continuity(verbose=False).to_excel(
+                w, sheet_name="Continuidad", index=False)
+        print(f"Resultados exportados a: {path}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 2 — LIFE-CYCLE SUBCLASS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class LifecycleAnalyzer(JoinpointAnalyzer):
-    """
-    Specialised subclass for life-cycle (age-group) joinpoint analysis.
+    """Subclase para el análisis por grupos del ciclo de vida."""
 
-    Adds ordered group display and a comparative APC bar chart across
-    life-cycle stages, complementing the inherited trend and map plots.
+    DEFAULT_ORDER = ["Children", "Adolescents", "Young Adults", "Adults", "Older Adults"]
 
-    Standard life-cycle groups (customisable via group_order):
-        Children · Adolescents · Young Adults · Adults · Older Adults
-
-    Parameters
-    ----------
-    data : pd.DataFrame
-        Must contain year_col, rate_col, and lifecycle_col.
-    year_col : str
-        Year column name.
-    rate_col : str
-        Rate/indicator column name.
-    lifecycle_col : str
-        Column containing age-group labels.
-    group_order : list[str] or None
-        Display order for age groups in plots and tables.
-        Defaults to the five standard groups above.
-    **kwargs
-        Additional arguments forwarded to JoinpointAnalyzer.
-
-    Examples
-    --------
-    >>> lc = LifecycleAnalyzer(
-    ...     df, year_col='Year', rate_col='MortalityRate',
-    ...     lifecycle_col='AgeGroup'
-    ... )
-    >>> lc.run()
-    >>> lc.plot_trend(title='Mortality by Life-Cycle Group')
-    >>> lc.plot_lifecycle_bars()
-    >>> lc.plot_map(region_col='Region')
-    """
-
-    DEFAULT_ORDER = [
-        'Children', 'Adolescents', 'Young Adults', 'Adults', 'Older Adults',
-    ]
-
-    def __init__(self, data, year_col, rate_col, lifecycle_col,
-                 group_order=None, **kwargs):
-        super().__init__(
-            data=data, year_col=year_col, rate_col=rate_col,
-            lifecycle_col=lifecycle_col, **kwargs,
-        )
+    def __init__(self, data, year_col, rate_col, lifecycle_col, group_order=None, **kw):
+        super().__init__(data=data, year_col=year_col, rate_col=rate_col,
+                         lifecycle_col=lifecycle_col, **kw)
         self.group_order = group_order or self.DEFAULT_ORDER
 
     def plot_lifecycle_bars(
         self,
-        title='APC by Life-Cycle Group and Segment',
-        ylabel='Annual Percent Change (%)',
+        title="APC por grupo del ciclo de vida y segmento",
+        ylabel="Cambio porcentual anual (%)",
         figsize=(10, 6),
         save_path=None,
     ):
         """
-        Grouped bar chart: APC per life-cycle group, coloured by segment.
+        Barras agrupadas del APC por grupo del ciclo de vida y segmento.
 
-        Bars above zero indicate increasing rates; below zero indicate
-        decreasing rates. Error bars represent 95 % CI.
+        Las barras por encima de cero indican tasas crecientes; por debajo,
+        decrecientes. Las barras de error representan el intervalo de
+        confianza al 95 %, derivado de la matriz de covarianzas conjunta.
 
         Parameters
         ----------
-        title : str
-            Chart title.
-        ylabel : str
-            Y-axis label.
+        title, ylabel : str
+            Título y etiqueta del eje vertical.
         figsize : tuple
-            Figure size in inches.
+            Tamaño de la figura, en pulgadas.
         save_path : str or None
-            Save figure at 300 dpi if provided.
+            Ruta donde guardar la figura a 300 ppp.
         """
+        import matplotlib.pyplot as plt
+
         if not self.results_:
-            print("Run .run() before .plot_lifecycle_bars().")
+            print("Ejecute .run() antes de .plot_lifecycle_bars().")
+            return
+        resumen = self.summary_table()
+        if resumen.empty:
+            print("No hay resultados que graficar.")
             return
 
-        summary = self.summary_table()
-        if summary.empty:
-            print("No results to plot.")
-            return
+        presentes = list(resumen["Group"].unique())
+        orden = [g for g in self.group_order if g in presentes]
+        orden += [g for g in presentes if g not in orden]
 
-        # Apply group ordering
-        all_groups = list(summary['Group'].unique())
-        ordered    = [g for g in self.group_order if g in all_groups]
-        ordered   += [g for g in all_groups if g not in ordered]
+        segmentos = list(resumen["Segment"].unique())
+        n_seg = len(segmentos)
+        x = np.arange(len(orden))
+        ancho = 0.8 / max(n_seg, 1)
+        tonos = ["black", "gray", "darkgray", "silver", "lightgray"]
 
-        segments = list(summary['Segment'].unique())
-        n_segs   = len(segments)
-        n_groups = len(ordered)
-        x        = np.arange(n_groups)
-        width    = 0.8 / n_segs
-        shades   = ['black', 'gray', 'darkgray', 'silver', 'lightgray']
-
-        plt.style.use('grayscale')
+        plt.style.use("grayscale")
         fig, ax = plt.subplots(figsize=figsize)
 
-        for i, seg in enumerate(segments):
-            sub    = summary[summary['Segment'] == seg].set_index('Group')
-            apcs   = [sub.loc[g, 'APC (%)'] if g in sub.index else 0.0
-                      for g in ordered]
-            ci_lo, ci_hi = [], []
-            for g in ordered:
+        for i, seg in enumerate(segmentos):
+            sub = resumen[resumen["Segment"] == seg].set_index("Group")
+            apcs, lo, hi = [], [], []
+            for g in orden:
                 if g in sub.index:
-                    raw = sub.loc[g, 'IC 95%'].strip('[]').split(',')
-                    ci_lo.append(float(raw[0]))
-                    ci_hi.append(float(raw[1]))
+                    apcs.append(float(sub.loc[g, "APC (%)"]))
+                    crudo = str(sub.loc[g, "IC 95%"]).strip("[]").split(",")
+                    lo.append(float(crudo[0]))
+                    hi.append(float(crudo[1]))
                 else:
-                    ci_lo.append(0.0); ci_hi.append(0.0)
+                    apcs.append(0.0)
+                    lo.append(0.0)
+                    hi.append(0.0)
+            err = np.vstack([np.array(apcs) - np.array(lo),
+                             np.array(hi) - np.array(apcs)])
+            err = np.clip(err, 0, None)
+            ax.bar(x + i * ancho - 0.4 + ancho / 2, apcs, ancho,
+                   yerr=err, capsize=3, label=str(seg),
+                   color=tonos[i % len(tonos)], alpha=0.85,
+                   error_kw={"linewidth": 0.9})
 
-            err_lo = [a - l for a, l in zip(apcs, ci_lo)]
-            err_hi = [h - a for a, h in zip(apcs, ci_hi)]
-
-            ax.bar(
-                x + i * width - (n_segs - 1) * width / 2,
-                apcs, width * 0.9,
-                label=seg,
-                color=shades[i % len(shades)],
-                yerr=[err_lo, err_hi],
-                capsize=3, error_kw={'linewidth': 0.8},
-            )
-
-        ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+        ax.axhline(0, color="black", linewidth=0.9)
         ax.set_xticks(x)
-        ax.set_xticklabels(ordered, rotation=20, ha='right', fontsize=9)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title, fontweight='bold')
-        ax.legend(title='Segment', fontsize=8)
-        ax.grid(True, alpha=0.2, axis='y')
+        ax.set_xticklabels(orden, rotation=15, ha="right", fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.legend(fontsize=8, title="Segmento", title_fontsize=8)
+        ax.grid(True, alpha=0.2, axis="y")
 
         plt.tight_layout()
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Lifecycle bar chart saved: {save_path}")
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            print(f"Figura de ciclo de vida guardada: {save_path}")
         plt.show()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 3 — CONVENIENCE FUNCTION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def analyze_health_trend(
-    data,
-    year_col,
-    rate_col,
-    breakpoint_years=None,
-    max_breakpoints=4,
-    group_col=None,
-    lifecycle_col=None,
-    plot=True,
-    plot_bic=False,
-    **kwargs,
-):
-    """
-    One-line wrapper: run analysis and return the summary table.
-
-    Automatically selects LifecycleAnalyzer when lifecycle_col is provided,
-    otherwise uses JoinpointAnalyzer.
-
-    Parameters
-    ----------
-    data : pd.DataFrame
-        Input data.
-    year_col : str
-        Year column name.
-    rate_col : str
-        Rate/indicator column name.
-    breakpoint_years : list[int] or None
-        Force specific breakpoints (optional).
-    max_breakpoints : int
-        Maximum breakpoints to search for (default 4).
-    group_col : str or None
-        Stratification column (optional).
-    lifecycle_col : str or None
-        Life-cycle group column; triggers LifecycleAnalyzer.
-    plot : bool
-        Show trend plot (default True).
-    plot_bic : bool
-        Show BIC selection chart (default False).
-    **kwargs
-        Forwarded to the analyzer class.
-
-    Returns
-    -------
-    pd.DataFrame
-        Publication-ready summary table.
-
-    Examples
-    --------
-    >>> summary = analyze_health_trend(
-    ...     df, year_col='Year', rate_col='IncidenceRate',
-    ...     lifecycle_col='AgeGroup', max_breakpoints=3
-    ... )
-    >>> print(summary)
-    """
+def analyze_health_trend(data, year_col, rate_col, weight_col=None,
+                         breakpoint_years=None, max_breakpoints=4, group_col=None,
+                         lifecycle_col=None, **kw):
+    """Ejecuta el análisis completo y devuelve la tabla resumen."""
+    cls = LifecycleAnalyzer if lifecycle_col else JoinpointAnalyzer
     if lifecycle_col:
-        az = LifecycleAnalyzer(
-            data=data, year_col=year_col, rate_col=rate_col,
-            lifecycle_col=lifecycle_col,
-            breakpoint_years=breakpoint_years,
-            max_breakpoints=max_breakpoints, **kwargs,
-        )
+        az = cls(data=data, year_col=year_col, rate_col=rate_col,
+                 lifecycle_col=lifecycle_col, weight_col=weight_col,
+                 breakpoint_years=breakpoint_years,
+                 max_breakpoints=max_breakpoints, **kw)
     else:
-        az = JoinpointAnalyzer(
-            data=data, year_col=year_col, rate_col=rate_col,
-            breakpoint_years=breakpoint_years,
-            max_breakpoints=max_breakpoints,
-            group_col=group_col, **kwargs,
-        )
-
+        az = cls(data=data, year_col=year_col, rate_col=rate_col,
+                 weight_col=weight_col, breakpoint_years=breakpoint_years,
+                 max_breakpoints=max_breakpoints, group_col=group_col, **kw)
     az.run()
-    if plot:
-        az.plot_trend()
-    if plot_bic:
-        az.plot_bic()
     return az.summary_table()
