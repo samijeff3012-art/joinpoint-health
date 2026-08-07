@@ -1,0 +1,47 @@
+{
+  "title": "JoinPoint-Health: regresión joinpoint para indicadores de salud",
+  "version": "2.1.0",
+  "upload_type": "software",
+  "language": "spa",
+  "license": "MIT",
+  "access_right": "open",
+  "description": "<p>M&oacute;dulo Python que implementa la regresi&oacute;n joinpoint para el an&aacute;lisis de tendencias en indicadores cuantitativos de salud. Detecta autom&aacute;ticamente los quiebres estructurales mediante BIC y reporta el cambio porcentual anual (APC) de cada segmento con su intervalo de confianza.</p><p><strong>Novedades de la v2.1.0:</strong> ajuste continuo mediante splines lineales, que corrige el modelo discontinuo de la v2.0.0 y lo hace corresponder con la regresi&oacute;n joinpoint de Kim et al. (2000); cada observaci&oacute;n se emplea una sola vez; recuento de par&aacute;metros del BIC acorde al modelo continuo (2+2k); errores est&aacute;ndar del APC por m&eacute;todo delta sobre la matriz de covarianzas conjunta; agregaci&oacute;n ponderada mediante <code>weight_col</code>; validaci&oacute;n de entradas; m&eacute;todos <code>check_continuity()</code> y <code>fitted_values()</code>; suite de 17 pruebas de propiedades formales.</p><p><strong>Esta versi&oacute;n cambia los APC estimados respecto de la v2.0.0.</strong> Los an&aacute;lisis realizados con la versi&oacute;n anterior deben reejecutarse. V&eacute;ase CHANGELOG.md.</p>",
+  "keywords": [
+    "regresión joinpoint",
+    "cambio porcentual anual",
+    "series de tiempo",
+    "epidemiología",
+    "salud pública",
+    "Python",
+    "Perú"
+  ],
+  "creators": [
+    {
+      "name": "Samillan Vasquez, Cesar Jefferson",
+      "affiliation": "Universidad Nacional Toribio Rodríguez de Mendoza de Amazonas",
+      "orcid": "0009-0003-8916-6508"
+    },
+    {
+      "name": "Acosta Román, Mercedes",
+      "affiliation": "Universidad Nacional Autónoma de Tayacaja Daniel Hernández Morillo",
+      "orcid": "0000-0002-4792-4185"
+    },
+    {
+      "name": "León Montoya, Gladys Bernardita",
+      "affiliation": "Universidad Nacional Toribio Rodríguez de Mendoza de Amazonas",
+      "orcid": "0000-0003-0578-5030"
+    },
+    {
+      "name": "Bazán Valque, Rosa Ysabel",
+      "affiliation": "Universidad Nacional Toribio Rodríguez de Mendoza de Amazonas",
+      "orcid": "0000-0002-1674-6136"
+    }
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "10.5281/zenodo.20151357",
+      "relation": "isVersionOf",
+      "scheme": "doi"
+    }
+  ]
+}
